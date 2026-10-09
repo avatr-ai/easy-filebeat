@@ -26,15 +26,17 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/sirupsen/logrus"
 )
 
 func TestNewHarvester(t *testing.T) {
 	logger := logrus.New()
-	logger.SetOutput(os.Stdout)
-	harvester, err := NewHarvester(Config{
+	logger.SetOutput(os.Stderr)
+	h, err := NewHarvester(Config{
 		Path:     "/data/Github/polaris-server/log/operation/polaris-history.log",
 		MetaPath: "./test",
 		Logger:   logger,
@@ -44,12 +46,13 @@ func TestNewHarvester(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
 
-	harvester.RegisterSink(&mockSink{})
-	harvester.Run(ctx)
+	h.Run(ctx)
 
 	<-ctx.Done()
+	h.Close()
 }
 
 type mockSink struct {
@@ -58,4 +61,103 @@ type mockSink struct {
 // OnMessage
 func (s *mockSink) OnMessage(msg string) {
 	fmt.Printf("%s\n", msg)
+}
+
+// TestCloseWithoutRun verifies that Close() before Run() does not panic.
+func TestCloseWithoutRun(t *testing.T) {
+	logger := logrus.New()
+	logger.SetOutput(os.Stderr)
+
+	tmpDir := t.TempDir()
+	metaPath := filepath.Join(tmpDir, "meta")
+
+	h, err := NewHarvester(Config{
+		Path:     filepath.Join(tmpDir, "test.log"),
+		MetaPath: metaPath,
+		Logger:   logger,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Close without Run — should not panic
+	if err := h.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestCloseMultipleTimes verifies that calling Close() multiple times
+// does not panic or hang.
+func TestCloseMultipleTimes(t *testing.T) {
+	logger := logrus.New()
+	logger.SetOutput(os.Stderr)
+
+	tmpDir := t.TempDir()
+	metaPath := filepath.Join(tmpDir, "meta")
+	logFile, err := os.Create(filepath.Join(tmpDir, "test.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	logFile.Close()
+
+	h, err := NewHarvester(Config{
+		Path:     filepath.Join(tmpDir, "test.log"),
+		MetaPath: metaPath,
+		Logger:   logger,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	h.Run(context.Background())
+
+	// Multiple closes — should not panic or return error
+	if err := h.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestCloseStopsGoroutines verifies that Close() causes the background
+// goroutines to exit within a reasonable timeout.
+func TestCloseStopsGoroutines(t *testing.T) {
+	logger := logrus.New()
+	logger.SetOutput(os.Stderr)
+
+	tmpDir := t.TempDir()
+	metaPath := filepath.Join(tmpDir, "meta")
+	logFile, err := os.Create(filepath.Join(tmpDir, "test.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	logFile.Close()
+
+	h, err := NewHarvester(Config{
+		Path:     filepath.Join(tmpDir, "test.log"),
+		MetaPath: metaPath,
+		Logger:   logger,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	h.Run(context.Background())
+
+	done := make(chan struct{})
+	go func() {
+		h.Close()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Close returned without hanging — goroutines stopped
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close() timed out — goroutines may not have stopped")
+	}
 }

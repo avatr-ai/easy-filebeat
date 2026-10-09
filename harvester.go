@@ -41,7 +41,8 @@ import (
 )
 
 var (
-	EmptyWaitFiles error = errors.New("empty wait files")
+	EmptyWaitFiles    error = errors.New("empty wait files")
+	errHarvesterClosed       = errors.New("harvester closed")
 )
 
 // Config easy-filebeat 的配置信息
@@ -105,6 +106,10 @@ type harvester struct {
 
 	haveFileCond *sync.Cond
 	haveFileCh   chan struct{}
+
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+	closed int32
 }
 
 // Init
@@ -143,23 +148,33 @@ func (beater *harvester) Init() error {
 
 // Run 执行监听逻辑
 func (beater *harvester) Run(ctx context.Context) {
+	ctx, beater.cancel = context.WithCancel(ctx)
+
+	beater.wg.Add(2)
 
 	// 开启定时刷新待处理文件列表信息
 	go func(ctx context.Context) {
+		defer beater.wg.Done()
 		// 设置待处理文件列表信息数据
-		if err := beater.setWaitDealFiles(); err != nil {
+		if err := beater.setWaitDealFiles(ctx); err != nil {
+			if errors.Is(err, context.Canceled) {
+				return
+			}
 			beater.OnError(err)
 		}
 
 		ticker := time.NewTicker(time.Duration(5 * time.Second))
+		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
-				if err := beater.setWaitDealFiles(); err != nil {
+				if err := beater.setWaitDealFiles(ctx); err != nil {
+					if errors.Is(err, context.Canceled) {
+						return
+					}
 					beater.logger.Errorf("set wait deail files fail : %+v", err)
 				}
 			case <-ctx.Done():
-				ticker.Stop()
 				return
 			}
 		}
@@ -167,13 +182,22 @@ func (beater *harvester) Run(ctx context.Context) {
 
 	//
 	go func(ctx context.Context) {
+		defer beater.wg.Done()
 		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
 			// 元数据没有任何信息
 			if beater.curReader.Load() == nil {
 				if err := beater.initReaderFromWait(); err != nil {
-					// if errors.Is(err, os.ErrNotExist) {
-					// 	continue
-					// }
+					select {
+					case <-ctx.Done():
+						return
+					default:
+					}
 					beater.OnError(err)
 					time.Sleep(100 * time.Millisecond)
 				} else {
@@ -183,11 +207,11 @@ func (beater *harvester) Run(ctx context.Context) {
 		}
 
 		ticker := time.NewTicker(time.Duration(50 * time.Millisecond))
+		defer ticker.Stop()
 
 		for {
 			select {
 			case <-ctx.Done():
-				ticker.Stop()
 				return
 			case <-ticker.C:
 				beater.innerRun()
@@ -250,7 +274,25 @@ func (beater *harvester) RegisterSink(sink Sink) {
 //	@receiver beater
 //	@return error
 func (beater *harvester) Close() error {
-	return beater.curReader.Load().(Reader).Close()
+	if !atomic.CompareAndSwapInt32(&beater.closed, 0, 1) {
+		return nil
+	}
+
+	if beater.cancel != nil {
+		beater.cancel()
+	}
+
+	// Wake up any goroutine waiting in haveFileCond.Wait() so it can
+	// observe the closed flag and exit.
+	beater.haveFileCond.Broadcast()
+
+	beater.wg.Wait()
+
+	r := beater.curReader.Load()
+	if r != nil {
+		return r.(Reader).Close()
+	}
+	return nil
 }
 
 // initReaderFromMetadata
@@ -276,6 +318,12 @@ func (beater *harvester) initReaderFromWait() error {
 	beater.lock.Lock()
 	if len(beater.waitDealFiles) == 0 {
 		beater.haveFileCond.Wait()
+		// After waking up (possibly from Close() broadcasting), check if
+		// the harvester has been closed so we don't access an empty slice.
+		if atomic.LoadInt32(&beater.closed) != 0 {
+			beater.lock.Unlock()
+			return errHarvesterClosed
+		}
 	}
 
 	waitDeal := beater.waitDealFiles[len(beater.waitDealFiles)-1]
@@ -305,14 +353,21 @@ func (beater *harvester) initReaderFromWait() error {
 // setWaitDealFiles 更新待处理的文件列表
 //
 //	@receiver beater
+//	@param ctx
 //	@return error
-func (beater *harvester) setWaitDealFiles() error {
+func (beater *harvester) setWaitDealFiles(ctx context.Context) error {
 	var (
 		result []os.FileInfo
 		err    error
 	)
 
 	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
 		result, err = beater.loadCurFiles()
 		if err != nil {
 			return err
