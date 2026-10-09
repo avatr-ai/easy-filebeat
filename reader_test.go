@@ -25,6 +25,8 @@ package filebeat_test
 import (
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -48,10 +50,20 @@ func Test_ReaderLine(t *testing.T) {
 
 	offset := int64(0)
 
-	reader, err := filebeat.NewLineReader("./test_linereader_file.log", &offset)
+	// 每个测试自己创建日志，避免依赖工作区残留文件或其他测试的清理顺序。
+	filename := filepath.Join(t.TempDir(), "reader.log")
+	if err := os.WriteFile(filename, []byte(strings.Join(expectLines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := filebeat.NewLineReader(filename, &offset)
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if err := reader.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 
 	index := 0
 	for {
