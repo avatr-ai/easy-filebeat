@@ -25,6 +25,8 @@ package filebeat_test
 import (
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -46,9 +48,16 @@ func Test_ReaderLine(t *testing.T) {
 		"test_line_log=10",
 	}
 
+	// 在临时目录中生成本次测试的日志文件，避免依赖仓库里不存在的固定路径
+	logPath := filepath.Join(t.TempDir(), "test_linereader_file.log")
+	content := strings.Join(expectLines, "\n") + "\n"
+	if err := os.WriteFile(logPath, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
 	offset := int64(0)
 
-	reader, err := filebeat.NewLineReader("./test_linereader_file.log", &offset)
+	reader, err := filebeat.NewLineReader(logPath, &offset)
 	if err != nil {
 		t.Fatal(err)
 	}

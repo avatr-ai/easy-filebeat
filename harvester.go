@@ -105,6 +105,24 @@ type harvester struct {
 
 	haveFileCond *sync.Cond
 	haveFileCh   chan struct{}
+
+	// runLock 保护 cancel 与 closing 的读写，保证 Run 与 Close 并发调用时的顺序
+	runLock sync.Mutex
+	// cancel 用于通知 Run 启动的后台 goroutine 退出
+	cancel context.CancelFunc
+	// wg 跟踪 Run 启动的两个后台 goroutine
+	wg sync.WaitGroup
+	// closing 幂等关闭标志，等于 1 表示已进入关闭流程
+	closing int32
+	// closeOnce 保证真正的关闭流程只执行一次
+	closeOnce sync.Once
+	// closeErr 保存 reader 关闭错误，供幂等 Close 复用
+	closeErr error
+}
+
+// isClosing 返回是否已经进入关闭流程
+func (beater *harvester) isClosing() bool {
+	return atomic.LoadInt32(&beater.closing) == 1
 }
 
 // Init
@@ -144,22 +162,39 @@ func (beater *harvester) Init() error {
 // Run 执行监听逻辑
 func (beater *harvester) Run(ctx context.Context) {
 
+	// 派生出可取消的 context，Close 通过 cancel 通知后台 goroutine 退出
+	ctx, cancel := context.WithCancel(ctx)
+
+	beater.runLock.Lock()
+	// 已经进入关闭流程，直接返回，避免在 Close 之后又启动新的后台 goroutine
+	if beater.isClosing() {
+		beater.runLock.Unlock()
+		cancel()
+		return
+	}
+	beater.cancel = cancel
+	// 先登记再启动 goroutine，避免与 Close 中的 wg.Wait 产生竞态
+	beater.wg.Add(2)
+	beater.runLock.Unlock()
+
 	// 开启定时刷新待处理文件列表信息
 	go func(ctx context.Context) {
+		defer beater.wg.Done()
+
 		// 设置待处理文件列表信息数据
-		if err := beater.setWaitDealFiles(); err != nil {
+		if err := beater.setWaitDealFiles(ctx); err != nil {
 			beater.OnError(err)
 		}
 
 		ticker := time.NewTicker(time.Duration(5 * time.Second))
+		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
-				if err := beater.setWaitDealFiles(); err != nil {
+				if err := beater.setWaitDealFiles(ctx); err != nil {
 					beater.logger.Errorf("set wait deail files fail : %+v", err)
 				}
 			case <-ctx.Done():
-				ticker.Stop()
 				return
 			}
 		}
@@ -167,27 +202,29 @@ func (beater *harvester) Run(ctx context.Context) {
 
 	//
 	go func(ctx context.Context) {
-		for {
-			// 元数据没有任何信息
-			if beater.curReader.Load() == nil {
-				if err := beater.initReaderFromWait(); err != nil {
-					// if errors.Is(err, os.ErrNotExist) {
-					// 	continue
-					// }
-					beater.OnError(err)
-					time.Sleep(100 * time.Millisecond)
-				} else {
-					break
+		defer beater.wg.Done()
+
+		// 等待并初始化当前要处理的 Reader；ctx 取消或已进入关闭流程时立即退出
+		for beater.curReader.Load() == nil {
+			if err := beater.initReaderFromWait(); err != nil {
+				if beater.isClosing() {
+					return
+				}
+				beater.OnError(err)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(100 * time.Millisecond):
 				}
 			}
 		}
 
 		ticker := time.NewTicker(time.Duration(50 * time.Millisecond))
+		defer ticker.Stop()
 
 		for {
 			select {
 			case <-ctx.Done():
-				ticker.Stop()
 				return
 			case <-ticker.C:
 				beater.innerRun()
@@ -245,12 +282,44 @@ func (beater *harvester) RegisterSink(sink Sink) {
 	beater.sinks = append(beater.sinks, sink)
 }
 
-// Close
+// Close 优雅关闭 Harvester：
+//  1. 标记关闭并取消 Run 派生的 context，通知后台 goroutine 退出；
+//  2. 唤醒可能阻塞在条件变量上的初始化 goroutine；
+//  3. 等待两个后台 goroutine 真正退出；
+//  4. 安全关闭当前 reader（未 Run 或尚无 reader 时跳过）。
+//
+// Close 是幂等的，重复或并发调用不会 panic、不会死锁、不会重复关闭。
 //
 //	@receiver beater
 //	@return error
 func (beater *harvester) Close() error {
-	return beater.curReader.Load().(Reader).Close()
+	beater.closeOnce.Do(func() {
+		beater.runLock.Lock()
+		atomic.StoreInt32(&beater.closing, 1)
+		cancel := beater.cancel
+		beater.runLock.Unlock()
+
+		// 通知后台 goroutine 退出
+		if cancel != nil {
+			cancel()
+		}
+
+		// 唤醒可能阻塞在 haveFileCond 上的初始化 goroutine（与 Wait 同锁，避免丢失唤醒）
+		beater.lock.Lock()
+		beater.haveFileCond.Broadcast()
+		beater.lock.Unlock()
+
+		// 返回前保证两个后台 goroutine 均已结束，之后才允许关闭 reader
+		beater.wg.Wait()
+
+		// curReader 为 nil（未调用 Run 或尚未初始化出 reader）时跳过关闭
+		if r := beater.curReader.Load(); r != nil {
+			if reader, ok := r.(Reader); ok {
+				beater.closeErr = reader.Close()
+			}
+		}
+	})
+	return beater.closeErr
 }
 
 // initReaderFromMetadata
@@ -274,7 +343,12 @@ func (beater *harvester) initReaderFromMetadata() error {
 func (beater *harvester) initReaderFromWait() error {
 
 	beater.lock.Lock()
-	if len(beater.waitDealFiles) == 0 {
+	for len(beater.waitDealFiles) == 0 {
+		// 已进入关闭流程，避免在关闭过程中继续初始化
+		if beater.isClosing() {
+			beater.lock.Unlock()
+			return ErrorClosed
+		}
 		beater.haveFileCond.Wait()
 	}
 
@@ -306,7 +380,7 @@ func (beater *harvester) initReaderFromWait() error {
 //
 //	@receiver beater
 //	@return error
-func (beater *harvester) setWaitDealFiles() error {
+func (beater *harvester) setWaitDealFiles(ctx context.Context) error {
 	var (
 		result []os.FileInfo
 		err    error
@@ -321,7 +395,12 @@ func (beater *harvester) setWaitDealFiles() error {
 		// 如果当前获取到的文件列表为空
 		result = beater.ignoreAlreadDeal(result)
 		if len(result) == 0 {
-			time.Sleep(time.Duration(200 * time.Millisecond))
+			// 等待新文件出现，同时保证 Close 取消 context 后能及时退出
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Duration(200 * time.Millisecond)):
+			}
 		} else {
 			break
 		}
